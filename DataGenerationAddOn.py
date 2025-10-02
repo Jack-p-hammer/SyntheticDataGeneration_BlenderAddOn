@@ -1,9 +1,27 @@
-# ==== Synthetic Data Add-on: Assets + Bake Motion + Depth Point Clouds + Video ====
-# Works on Blender 3.x / 4.x
+# ==== MERS Lab – Synthetic Data Builder (Simplified UX) ====
+# Goals
+# - One simple "Quick Add" block controls *where* an asset is placed, either in World or relative to another object
+# - Import assets from a folder of .blend files (dropdown)
+# - Table (UIList) of added items with editable params
+# - Bake Motion (from frame 1) using velocity + optional relative motion
+# - Depth-style point cloud export (ONE CSV for all frames)
+# - Render MP4 and reset timeline to frame 1 after export/render
+# Works with Blender 3.x / 4.x
+
+bl_info = {
+    "name": "MERS Lab – Synthetic Data Builder (Simplified)",
+    "author": "Jack + ChatGPT",
+    "version": (0, 5, 0),
+    "blender": (3, 0, 0),
+    "location": "View3D > Sidebar > Data Generation",
+    "description": "Import assets with world/relative placement, bake motion, export point clouds, render video.",
+    "category": "Object",
+}
+
 import bpy
 from bpy.props import (
     EnumProperty, PointerProperty, FloatVectorProperty, CollectionProperty,
-    IntProperty, StringProperty, BoolProperty
+    IntProperty, StringProperty, BoolProperty, FloatProperty
 )
 from bpy.types import Panel, PropertyGroup, Operator, UIList
 from pathlib import Path
@@ -12,20 +30,15 @@ import csv
 import os
 import math
 
-bl_info = {
-    "name": "MERS Lab – Synthetic Data Builder",
-    "author": "Jack + ChatGPT",
-    "version": (0, 3, 0),
-    "blender": (3, 0, 0),
-    "location": "View3D > Sidebar > Data Generation",
-    "description": "Import assets, bake simple motions, export depth-style point clouds, render video.",
-    "category": "Object",
-}
-
-# --- CONFIG: change to your asset folder ---
+# ---------------------------------------------------------
+# CONFIG: change to your asset folder containing .blend files
+# ---------------------------------------------------------
 ASSET_DIR = Path(r"C:/Users/jonat/Documents/Course Work/Current Courses/UROP/SyntheticDataGeneration/CustomAssets")
 
-# --- Dynamic enum: list .blend files in ASSET_DIR ---
+# ---------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------
+
 def enum_assets(self, context):
     items = []
     if ASSET_DIR.exists():
@@ -36,20 +49,8 @@ def enum_assets(self, context):
         items = [("NONE", "No .blend assets found", "Put .blend files in ASSET_DIR")]
     return items
 
-# ----------------------- Helpers -----------------------
-def _child_names(coll):
-    try:
-        return [c.name for c in coll.children]
-    except Exception:
-        return []
 
-def _object_names(coll):
-    try:
-        return [o.name for o in coll.objects]
-    except Exception:
-        return []
-
-def draw_vec3_column_inline(layout, data, prop, title="Vector"):
+def draw_vec3_inline(layout, data, prop, title="Vector"):
     box = layout.box()
     box.use_property_split = False
     box.use_property_decorate = False
@@ -60,16 +61,25 @@ def draw_vec3_column_inline(layout, data, prop, title="Vector"):
     col_l.label(text="");    col_r.prop(data, prop, index=1, text="Y")
     col_l.label(text="");    col_r.prop(data, prop, index=2, text="Z")
 
+
+def _child_names(coll):
+    try: return [c.name for c in coll.children]
+    except Exception: return []
+
+def _object_names(coll):
+    try: return [o.name for o in coll.objects]
+    except Exception: return []
+
+
 def _ensure_camera(context, props):
     cam = context.scene.camera if props.use_active_camera else props.camera_override
     if cam and cam.type == 'CAMERA':
         return cam
-    # create a simple camera if none
     bpy.ops.object.camera_add(location=(0.0, -5.0, 2.0), rotation=(math.radians(75), 0, 0))
     context.scene.camera = bpy.context.active_object
     return context.scene.camera
 
-# Ray for pixel (i,j) in WxH using camera frustum
+
 def _camera_ray_for_pixel(cam_obj, i, j, W, H):
     cam = cam_obj.data
     frame = cam.view_frame(scene=bpy.context.scene)  # [bl, br, tr, tl]
@@ -82,7 +92,59 @@ def _camera_ray_for_pixel(cam_obj, i, j, W, H):
     direction = (p_world - origin).normalized()
     return origin, direction
 
-# ----------------------- Data Model -----------------------
+# ---- Bounding boxes & relative placement ----
+
+def _world_bbox_min_max(ob):
+    mw = ob.matrix_world
+    corners = [mw @ Vector(c) for c in getattr(ob, 'bound_box', [])] if getattr(ob, 'bound_box', None) else []
+    if not corners:
+        loc = mw.translation
+        return loc.copy(), loc.copy()
+    xs, ys, zs = zip(*[(c.x, c.y, c.z) for c in corners])
+    return Vector((min(xs), min(ys), min(zs))), Vector((max(xs), max(ys), max(zs)))
+
+
+def _group_bbox_min_max(root):
+    if not root:
+        z = Vector((0, 0, 0))
+        return z, z
+    mins, maxs = [], []
+    stack = list(root.children)
+    while stack:
+        ob = stack.pop()
+        if ob.type != 'EMPTY':
+            mn, mx = _world_bbox_min_max(ob)
+            mins.append(mn); maxs.append(mx)
+        stack.extend(list(ob.children))
+    if not mins:
+        loc = root.matrix_world.translation.copy()
+        return loc, loc
+    minx = Vector((min(v.x for v in mins), min(v.y for v in mins), min(v.z for v in mins)))
+    maxx = Vector((max(v.x for v in maxs), max(v.y for v in maxs), max(v.z for v in maxs)))
+    return minx, maxx
+
+
+def _place_on_top(child_root, ref_ob, margin=0.0, align_xy=True, extra_offset=None):
+    if not (child_root and ref_ob):
+        return
+    ref_min, ref_max = _world_bbox_min_max(ref_ob)
+    ref_top_z = ref_max.z
+    grp_min, grp_max = _group_bbox_min_max(child_root)
+    grp_center_xy = Vector(((grp_min.x + grp_max.x)/2, (grp_min.y + grp_max.y)/2, 0.0))
+    grp_bottom = Vector((grp_center_xy.x, grp_center_xy.y, grp_min.z))
+    ref_center_xy = Vector(((ref_min.x + ref_max.x)/2, (ref_min.y + ref_max.y)/2, 0.0))
+    tgt_bottom = Vector((ref_center_xy.x if align_xy else grp_center_xy.x,
+                         ref_center_xy.y if align_xy else grp_center_xy.y,
+                         ref_top_z + margin))
+    delta = tgt_bottom - grp_bottom
+    child_root.location += delta
+    if extra_offset is not None:
+        child_root.location += Vector(extra_offset)
+
+# ---------------------------------------------------------
+# Data Model
+# ---------------------------------------------------------
+
 def _item_location_update(self, context):
     if self.created_object:
         self.created_object.location = Vector(self.location)
@@ -91,35 +153,44 @@ def _item_name_update(self, context):
     if self.created_object and self.name:
         self.created_object.name = self.name
 
+
+
 class MyItem(PropertyGroup):
-    name: StringProperty(
-        name="Name", description="Display/Object name", default="",
-        update=_item_name_update
-    )
-    asset_name: StringProperty(name="Asset", description="File/datablock stem", default="")
-    location: FloatVectorProperty(
-        name="Location", subtype='TRANSLATION', size=3, default=(0,0,0),
-        update=_item_location_update
-    )
-    velocity: FloatVectorProperty(
-        name="Velocity (m/s)", subtype='VELOCITY', size=3, default=(0,0,0)
-    )
-    rel_frame: EnumProperty(
-        name="Relative To",
-        items=[("WORLD","World","World-frame velocity"),
-               ("OBJECT","Object","Velocity relative to a reference object")],
-        default="WORLD"
-    )
+    name: StringProperty(name="Name", default="", update=_item_name_update)
+    asset_name: StringProperty(name="Asset", default="")
+    location: FloatVectorProperty(name="Location", subtype='TRANSLATION', size=3, default=(0,0,0), update=_item_location_update)
+    velocity: FloatVectorProperty(name="Velocity (m/s)", subtype='VELOCITY', size=3, default=(0,0,0))
+    rel_frame: EnumProperty(name="Relative To",
+                            items=[("WORLD","World","World-frame velocity"),
+                                   ("OBJECT","Object","Velocity relative to a reference object")],
+                            default="WORLD")
     reference_object: PointerProperty(name="Reference Object", type=bpy.types.Object)
     created_object: PointerProperty(name="Created Object", type=bpy.types.Object)
 
+
+
 class MyAddonProperties(PropertyGroup):
-    # Quick Add
+    # Quick Add (EVERYTHING lives here: location + placement mode)
     my_enum: EnumProperty(name="Objects", description="Choose asset", items=enum_assets)
-    location: FloatVectorProperty(name="Location", subtype='TRANSLATION', size=3, default=(0,0,0))
+
+    # Placement-at-import block (first block for ease-of-use)
+    place_rel_mode: EnumProperty(name="Place Relative",
+                                 items=[("WORLD","World","Use absolute Location"),
+                                        ("OBJECT","Object","Place relative to a reference object")],
+                                 default="WORLD")
+    location: FloatVectorProperty(name="Location (World)", subtype='TRANSLATION', size=3, default=(0,0,0))
+    place_reference: PointerProperty(name="Reference", type=bpy.types.Object, description="Reference object (e.g., table)")
+    place_on_top: BoolProperty(name="Snap On Top", default=True, description="Place object on reference top surface")
+    place_margin: FloatProperty(name="Top Margin", default=0.01, min=0.0)
+    place_align_xy: BoolProperty(name="Center XY", default=True)
+    place_offset: FloatVectorProperty(name="Extra Offset", subtype='TRANSLATION', size=3, default=(0.0,0.0,0.0))
+
+    # Motion settings used for Bake
     velocity: FloatVectorProperty(name="Velocity (m/s)", subtype='VELOCITY', size=3, default=(0,0,0))
-    rel_frame: EnumProperty(name="Relative To", items=[("WORLD","World",""),("OBJECT","Object","")], default="WORLD")
-    reference_object: PointerProperty(name="Reference Object", type=bpy.types.Object)
+    rel_frame: EnumProperty(name="Motion Relative To",
+                            items=[("WORLD","World",""), ("OBJECT","Object","")],
+                            default="WORLD")
+    reference_object: PointerProperty(name="Motion Reference", type=bpy.types.Object)
 
     # Table
     items: CollectionProperty(type=MyItem)
@@ -132,17 +203,19 @@ class MyAddonProperties(PropertyGroup):
     pc_height: IntProperty(name="PC Height", default=240, min=8, max=2160)
     output_dir: StringProperty(name="Output Dir", subtype="DIR_PATH", default="//")
     file_base: StringProperty(name="File Base", default="synth_scene")
-
     make_video: BoolProperty(name="Also Render Video", default=True)
     video_kind: EnumProperty(name="Video", items=[("MP4","MP4 (H.264)","")], default="MP4")
     use_active_camera: BoolProperty(name="Use Active Camera", default=True)
     camera_override: PointerProperty(name="Camera", type=bpy.types.Object)
 
-# ----------------------- Import Operator -----------------------
+# ---------------------------------------------------------
+# Operators
+# ---------------------------------------------------------
+
 class MYADDON_OT_import_selected(Operator):
     bl_idname = "myaddon.import_selected"
-    bl_label   = "Add Selected Asset"
-    bl_description = "Append datablock named like the dropdown, place at Location, add to table"
+    bl_label = "Add Selected Asset"
+    bl_description = "Append datablock named like the dropdown and place according to the first block (World/Object)"
 
     def execute(self, context):
         props = context.scene.my_addon_props
@@ -150,7 +223,6 @@ class MYADDON_OT_import_selected(Operator):
         if name == "NONE":
             self.report({'WARNING'}, "No assets to import. Put .blend files in ASSET_DIR.")
             return {'CANCELLED'}
-
         libpath = ASSET_DIR / f"{name}.blend"
         if not libpath.exists():
             self.report({'ERROR'}, f"File not found: {libpath}")
@@ -163,7 +235,6 @@ class MYADDON_OT_import_selected(Operator):
             if not (has_col or has_obj):
                 self.report({'ERROR'}, f"'{name}' not found as Collection/Object in {libpath.name}.")
                 return {'CANCELLED'}
-
             with bpy.data.libraries.load(str(libpath), link=False) as (data_from, data_to):
                 if has_col: data_to.collections = [name]
                 else:       data_to.objects     = [name]
@@ -173,12 +244,11 @@ class MYADDON_OT_import_selected(Operator):
                 coll = bpy.data.collections.get(name)
                 if coll and coll.name not in _child_names(context.scene.collection):
                     context.scene.collection.children.link(coll)
-                # Create a controller Empty to move the whole asset group
                 if coll and coll.objects:
                     ctrl = bpy.data.objects.new(f"{name}_ctrl", None)
                     ctrl.empty_display_type = 'PLAIN_AXES'
                     context.scene.collection.objects.link(ctrl)
-                    ctrl.location = Vector(props.location)
+                    # parent the imported objects to controller
                     for ob in coll.objects:
                         ob.parent = ctrl
                         ob.matrix_parent_inverse = ctrl.matrix_world.inverted()
@@ -188,19 +258,30 @@ class MYADDON_OT_import_selected(Operator):
                 if ob:
                     if ob.name not in _object_names(context.scene.collection):
                         context.scene.collection.objects.link(ob)
-                    ob.location = Vector(props.location)
                     created = ob
 
-            bpy.context.view_layer.update()
             if created is None:
                 self.report({'WARNING'}, f"Nothing linked from {libpath.name}")
                 return {'CANCELLED'}
 
+            # ---- Placement (ONE PASS, from the first block) ----
+            if props.place_rel_mode == "WORLD" or not props.place_reference:
+                created.location = Vector(props.location) + Vector(props.place_offset)
+            else:
+                ref = props.place_reference
+                if props.place_on_top:
+                    _place_on_top(created, ref_ob=ref, margin=props.place_margin, align_xy=props.place_align_xy, extra_offset=Vector(props.place_offset))
+                else:
+                    created.location = ref.matrix_world.translation + Vector(props.place_offset)
+
+            bpy.context.view_layer.update()
+
+            # Add to table
             row = props.items.add()
             row.asset_name = name
             row.created_object = created
             row.name = created.name
-            row.location = created.location[:]  # sync
+            row.location = created.location[:]
             row.velocity = props.velocity
             row.rel_frame = props.rel_frame
             row.reference_object = props.reference_object
@@ -210,11 +291,11 @@ class MYADDON_OT_import_selected(Operator):
             self.report({'ERROR'}, f"Append failed: {e}")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Added '{name}' @ {tuple(round(v,3) for v in props.location)}")
+        self.report({'INFO'}, f"Added '{name}'")
         return {'FINISHED'}
 
-# ----------------------- Bake Motion -----------------------
-class MYADDON_OT_bake_motion(bpy.types.Operator):
+
+class MYADDON_OT_bake_motion(Operator):
     bl_idname = "myaddon.bake_motion"
     bl_label = "Bake Motion"
     bl_description = "Insert location keyframes for all items using velocity and relative frame (starts at frame 1)"
@@ -224,37 +305,42 @@ class MYADDON_OT_bake_motion(bpy.types.Operator):
         props = scn.my_addon_props
         fps = props.bake_fps
         total_frames = props.bake_seconds * fps
-
         start = 1
         end   = start + total_frames
 
-        # Make the range visible & start at 1
         scn.frame_start = start
         scn.frame_end   = end
         scn.frame_current = start
 
-        # Capture bases at frame 1
         scn.frame_set(start)
         base = {}
         ref0 = {}
         for it in props.items:
             ob = it.created_object
-            if not ob:
-                continue
+            if not ob: continue
             base[it.name] = ob.location.copy()
             if it.rel_frame == "OBJECT" and it.reference_object:
                 ref0[it.name] = it.reference_object.matrix_world.translation.copy()
             else:
                 ref0[it.name] = Vector((0,0,0))
 
-        # Key each frame
+        # Clear previous location keys in range
+        for it in props.items:
+            ob = it.created_object
+            if not (ob and ob.animation_data and ob.animation_data.action):
+                continue
+            act = ob.animation_data.action
+            for fc in [fc for fc in act.fcurves if fc.data_path == "location"]:
+                for kp in list(fc.keyframe_points):
+                    if start - 1e-6 <= kp.co.x <= end + 1e-6:
+                        fc.keyframe_points.remove(kp)
+
         for f in range(start, end + 1):
             scn.frame_set(f)
             t = (f - start) / fps
             for it in props.items:
                 ob = it.created_object
-                if not ob:
-                    continue
+                if not ob: continue
                 v = Vector(it.velocity)
                 if it.rel_frame == "WORLD" or not it.reference_object:
                     pos = base[it.name] + v * t
@@ -268,67 +354,189 @@ class MYADDON_OT_bake_motion(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ----------------------- Depth Point Cloud → ONE CSV -----------------------
+import csv, os, math, random, re
+from mathutils import Vector
+
+def _sanitize_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip().strip(".")
+    return name or "object"
+
+def _gather_mesh_objects(root_obj):
+    """Return all mesh children under a controller (includes root if it's a mesh)."""
+    meshes = []
+    if not root_obj:
+        return meshes
+    if root_obj.type == 'MESH':
+        meshes.append(root_obj)
+    stack = list(root_obj.children)
+    while stack:
+        ob = stack.pop()
+        if ob.type == 'MESH':
+            meshes.append(ob)
+        stack.extend(list(ob.children))
+    return meshes
+
+def _collect_world_triangles(mesh_objs, depsgraph):
+    """
+    Build a list of world-space triangles [(v0,v1,v2), ...] for all evaluated meshes.
+    """
+    tris = []
+    for ob in mesh_objs:
+        ob_eval = ob.evaluated_get(depsgraph)
+        me = ob_eval.to_mesh()
+        if not me:
+            continue
+        try:
+            me.calc_loop_triangles()
+            mw = ob_eval.matrix_world
+            verts = [mw @ v.co for v in me.vertices]
+            for lt in me.loop_triangles:
+                i0, i1, i2 = lt.vertices
+                tris.append((verts[i0], verts[i1], verts[i2]))
+        finally:
+            ob_eval.to_mesh_clear()
+    return tris
+
+def _triangle_area(a: Vector, b: Vector, c: Vector) -> float:
+    return (b - a).cross(c - a).length * 0.5
+
+def _cdf_from_triangles(tris):
+    cdf, total = [], 0.0
+    for (a,b,c) in tris:
+        total += _triangle_area(a,b,c)
+        cdf.append(total)
+    return cdf, total
+
+def _sample_on_triangle(a: Vector, b: Vector, c: Vector):
+    # Uniform barycentric
+    r1, r2 = random.random(), random.random()
+    s = math.sqrt(r1)
+    u = 1.0 - s
+    v = s * (1.0 - r2)
+    w = s * r2
+    return a*u + b*v + c*w
+
+def _sample_surface_points(tris, N, seed=None):
+    if seed is not None:
+        random.seed(seed)
+    if not tris:
+        return [Vector((0.0,0.0,0.0))] * N
+    cdf, total = _cdf_from_triangles(tris)
+    pts = []
+    for _ in range(N):
+        r = random.random() * total
+        # binary search
+        lo, hi = 0, len(cdf) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if r <= cdf[mid]:
+                hi = mid
+            else:
+                lo = mid + 1
+        a, b, c = tris[lo]
+        pts.append(_sample_on_triangle(a, b, c))
+    return pts
+
+# ------------------ Drop-in operator ------------------
+
 class MYADDON_OT_export_pointclouds(bpy.types.Operator):
     bl_idname = "myaddon.export_pointclouds"
-    bl_label = "Export Point Clouds (One CSV)"
-    bl_description = "Ray-cast from camera and write a single CSV with all frames; resets timeline to frame 1 after export"
+    bl_label = "Export Point Clouds (Surface, 1 Row/Frame)"
+    bl_description = (
+        "Uniformly sample N surface points for each object per frame (occlusion-free), "
+        "writing one CSV per object with rows = frames and columns = flattened XYZ triples. "
+        "Creates a new run folder and resets to frame 1 after export."
+    )
 
     def execute(self, context):
         scn = context.scene
         props = scn.my_addon_props
 
-        cam = context.scene.camera if props.use_active_camera else props.camera_override
-        if not cam or cam.type != 'CAMERA':
-            self.report({'ERROR'}, "No valid camera found.")
-            return {'CANCELLED'}
-
+        # Frame plan from your settings (start at 1)
         fps = props.bake_fps
         total_frames = props.bake_seconds * fps
         start = 1
         end   = start + total_frames
 
-        W, H = props.pc_width, props.pc_height
-        outdir = bpy.path.abspath(props.output_dir)
-        os.makedirs(outdir, exist_ok=True)
-        out_path = os.path.join(outdir, f"{props.file_base}.csv")
+        # Output folder: <OutputDir>/<FileBase>_object_clouds/
+        base_dir = bpy.path.abspath(props.output_dir)
+        os.makedirs(base_dir, exist_ok=True)
+        run_dir = os.path.join(base_dir, f"{props.file_base}_object_clouds")
+        os.makedirs(run_dir, exist_ok=True)
 
-        # object_id map from table order
-        id_map = {it.created_object.name: idx for idx, it in enumerate(props.items) if it.created_object}
+        # How many points per object per frame (fallback to 1024 if the prop doesn't exist)
+        N = getattr(props, "points_per_object", 512)
+        # Optional reproducibility
+        seed_base = getattr(props, "random_seed", 0) or None
+
+        # Header: frame, x1,y1,z1, ... xN,yN,zN
+        header = ["frame"] + [axis for i in range(1, N+1) for axis in (f"x{i}", f"y{i}", f"z{i}")]
 
         deps = context.evaluated_depsgraph_get()
-        clip_end = cam.data.clip_end
 
+        files = {}
+        writers = {}
         try:
-            with open(out_path, "w", newline="") as fh:
+            # Open a CSV per object (from your table)
+            for it in props.items:
+                root = it.created_object
+                if not root:
+                    continue
+                safe_name = _sanitize_filename(root.name)
+                path = os.path.join(run_dir, f"{safe_name}.csv")
+                fh = open(path, "w", newline="")
+                files[it.name] = fh
                 w = csv.writer(fh)
-                w.writerow(["frame","object_id","label","u","v","x","y","z","nx","ny","nz"])
-                for f in range(start, end + 1):
-                    scn.frame_set(f)
-                    for v in range(H):
-                        for u in range(W):
-                            origin, direction = _camera_ray_for_pixel(cam, u, v, W, H)
-                            hit, loc, normal, face_idx, ob, mat = scn.ray_cast(deps, origin, direction, distance=clip_end)
-                            if not hit or ob is None:
-                                continue
-                            label = ob.name
-                            oid = id_map.get(label, -1)
-                            w.writerow([f, oid, label, u, v, loc.x, loc.y, loc.z, normal.x, normal.y, normal.z])
+                w.writerow(header)
+                writers[it.name] = w
+
+            # Iterate frames and write a single row per frame per object
+            for f in range(start, end + 1):
+                scn.frame_set(f)
+
+                for it in props.items:
+                    root = it.created_object
+                    if not root:
+                        continue
+                    w = writers.get(it.name)
+                    if not w:
+                        continue
+
+                    mesh_objs = _gather_mesh_objects(root)
+                    tris = _collect_world_triangles(mesh_objs, deps)
+
+                    # Per-object, per-frame seed → repeatable if seed_base set
+                    seed = None if seed_base is None else (hash((seed_base, it.name, f)) & 0xFFFFFFFF)
+                    pts = _sample_surface_points(tris, N, seed=seed)
+
+                    # Flatten to one row
+                    flat = []
+                    for p in pts:
+                        flat.extend([p.x, p.y, p.z])
+                    w.writerow([f] + flat)
+
         except Exception as e:
-            self.report({'ERROR'}, f"Failed to write CSV: {e}")
+            # Close any opened files on error
+            for fh in files.values():
+                try: fh.close()
+                except Exception: pass
+            self.report({'ERROR'}, f"Export failed: {e}")
             return {'CANCELLED'}
 
-        # 🔁 Reset timeline to a clean starting point
+        # Close files cleanly
+        for fh in files.values():
+            fh.close()
+
+        # Reset timeline to a clean starting point
         scn.frame_start = 1
         scn.frame_end   = end
         scn.frame_current = 1
 
-        self.report({'INFO'}, f"Wrote point cloud CSV: {out_path}. Timeline reset to frame 1.")
+        self.report({'INFO'}, f"Exported per-object, per-frame rows to: {run_dir}. Timeline reset to frame 1.")
         return {'FINISHED'}
 
 
-# ----------------------- Render Video (MP4) -----------------------
-class MYADDON_OT_render_video(bpy.types.Operator):
+class MYADDON_OT_render_video(Operator):
     bl_idname = "myaddon.render_video"
     bl_label = "Render Video"
     bl_description = "Render animation to MP4 using bake settings; resets timeline to frame 1 after render"
@@ -359,15 +567,13 @@ class MYADDON_OT_render_video(bpy.types.Operator):
 
         bpy.ops.render.render(animation=True)
 
-        # 🔁 Reset timeline to a clean starting point
         scn.frame_start = 1
         scn.frame_end   = end
         scn.frame_current = 1
-
         self.report({'INFO'}, f"Rendered: {scn.render.filepath}. Timeline reset to frame 1.")
         return {'FINISHED'}
 
-# ----------------------- Table ops/UI -----------------------
+
 class MYADDON_OT_item_remove(Operator):
     bl_idname = "myaddon.item_remove"
     bl_label = "Remove Row"
@@ -381,8 +587,9 @@ class MYADDON_OT_item_remove(Operator):
     def execute(self, context):
         p = context.scene.my_addon_props
         p.items.remove(p.active_index)
-        p.active_index = max(0, min(p.active_index, len(p.items)-1))
+        p.active_index = max(0, min(p.active_index, len(p.items) - 1))
         return {'FINISHED'}
+
 
 class MYADDON_OT_item_select_in_viewport(Operator):
     bl_idname = "myaddon.item_select_in_viewport"
@@ -404,6 +611,7 @@ class MYADDON_OT_item_select_in_viewport(Operator):
             context.view_layer.objects.active = ob
         return {'FINISHED'}
 
+
 class MYADDON_UL_items(UIList):
     bl_idname = "MYADDON_UL_items"
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -416,7 +624,10 @@ class MYADDON_UL_items(UIList):
         if item.created_object:
             right.label(text=f"• {item.created_object.name}", icon='OBJECT_DATA')
 
-# ----------------------- Panel -----------------------
+# ---------------------------------------------------------
+# Panel (Simple, first block = placement-at-import)
+# ---------------------------------------------------------
+
 class TEST_PT_DataGenPanel(Panel):
     bl_label = "Data Generation For MERS Lab"
     bl_idname = "PT_DataGenPanel"
@@ -426,21 +637,34 @@ class TEST_PT_DataGenPanel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.scale_y = 1.08
+        layout.scale_y = 1.06
         props = context.scene.my_addon_props
 
-        # Quick Add
+        # --- Quick Add (single, easy block) ---
         box = layout.box()
         row = box.row(); row.label(text="Object to insert:")
         row = box.row(); row.prop(props, "my_enum", text="")
-        draw_vec3_column_inline(box, props, "location", title="Location")
-        draw_vec3_column_inline(box, props, "velocity", title="Velocity (m/s)")
-        sub = box.box(); sub.label(text="Relative Motion")
-        sub.prop(props, "rel_frame", text="Relative To")
+
+        place = box.box(); place.label(text="Placement (on Import)")
+        place.prop(props, "place_rel_mode", text="Relative")
+        if props.place_rel_mode == "WORLD":
+            draw_vec3_inline(place, props, "location", title="Location (World)")
+        else:
+            place.prop(props, "place_reference", text="Reference")
+            place.prop(props, "place_on_top", text="Snap On Top")
+            if props.place_on_top:
+                row = place.row(align=True)
+                row.prop(props, "place_align_xy", text="Center XY")
+                row.prop(props, "place_margin", text="Top Margin")
+            draw_vec3_inline(place, props, "place_offset", title="Extra Offset")
+
+        motion = box.box(); motion.label(text="Initial Motion (for Bake)")
+        motion.prop(props, "rel_frame", text="Relative To")
         if props.rel_frame == "OBJECT":
-            sub.prop(props, "reference_object", text="Reference Object")
-        row = box.row()
-        row.operator("myaddon.import_selected", icon='IMPORT', text="Add Selected Asset")
+            motion.prop(props, "reference_object", text="Motion Reference")
+        draw_vec3_inline(motion, props, "velocity", title="Velocity (m/s)")
+
+        row = box.row(); row.operator("myaddon.import_selected", icon='IMPORT', text="Add Selected Asset")
 
         layout.separator()
 
@@ -457,20 +681,18 @@ class TEST_PT_DataGenPanel(Panel):
             box2 = layout.box(); box2.label(text="Edit Selected")
             box2.prop(it, "name", text="Name")
             box2.label(text=f"Asset: {it.asset_name}")
-            draw_vec3_column_inline(box2, it, "location", title="Location")
-            draw_vec3_column_inline(box2, it, "velocity", title="Velocity (m/s)")
-            rowrf = box2.row(align=True)
-            rowrf.prop(it, "rel_frame", text="Relative To")
+            draw_vec3_inline(box2, it, "location", title="Location")
+            draw_vec3_inline(box2, it, "velocity", title="Velocity (m/s)")
+            rowrf = box2.row(align=True); rowrf.prop(it, "rel_frame", text="Relative To")
             if it.rel_frame == "OBJECT":
                 box2.prop(it, "reference_object", text="Reference Object")
             if it.created_object:
-                rowob = box2.row()
-                rowob.label(text=f"Linked Object: {it.created_object.name}", icon='OBJECT_DATA')
+                rowob = box2.row(); rowob.label(text=f"Linked Object: {it.created_object.name}", icon='OBJECT_DATA')
 
         layout.separator()
 
         # Recording / Export
-        rec = layout.box(); rec.label(text="Recording / Export")
+        rec = layout.box(); rec.label(text="Recording / Export (resets to frame 1 after export/render)")
         row = rec.row(align=True); row.prop(props, "bake_fps"); row.prop(props, "bake_seconds")
         row = rec.row(align=True); row.prop(props, "pc_width"); row.prop(props, "pc_height")
         row = rec.row(align=True); row.prop(props, "output_dir"); row.prop(props, "file_base")
@@ -484,7 +706,10 @@ class TEST_PT_DataGenPanel(Panel):
         if props.make_video:
             row = rec.row(align=True); row.operator("myaddon.render_video", icon='RENDER_ANIMATION')
 
-# ----------------------- Register -----------------------
+# ---------------------------------------------------------
+# Register
+# ---------------------------------------------------------
+
 classes = (
     MyItem,
     MyAddonProperties,
@@ -502,6 +727,7 @@ def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.my_addon_props = PointerProperty(type=MyAddonProperties)
+
 
 def unregister():
     del bpy.types.Scene.my_addon_props
